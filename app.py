@@ -33,7 +33,7 @@ with st.sidebar:
     model = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini"], index=0)
 
     # You can change these defaults anytime in the UI
-    default_sheet = "16fnfCvrUBysEXtf_OAWLW1aVQSAegqtxehxwkWF3q_0"
+    default_sheet = "1rVMPiaZ5eeATiPTUJc4sQHEJMYZ8BPvsweEn7NSoFZM"
     spreadsheet_id_input = st.text_input("Spreadsheet ID or URL (optional)", value=default_sheet)
     worksheet_name = st.text_input("Worksheet/Tab (rows)", value="sheet1")
 
