@@ -1,11 +1,15 @@
-import os, io, json, base64, time, re
-from typing import Any, Dict, List
+import io, os, re, json, base64, time
+from typing import Any, Dict, List, Tuple
 
-import streamlit as st
+import numpy as np
 import pandas as pd
+import streamlit as st
 from PIL import Image
 
-# Optional Sheets support
+# CV
+import cv2
+
+# Optional Sheets
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -13,39 +17,76 @@ try:
 except Exception:
     HAS_SHEETS = False
 
-# ----------------- App config -----------------
-st.set_page_config(page_title="Kannada Paper Tool Digitizer", page_icon="🧾", layout="centered")
-st.title("🧾 Kannada Paper Tool → JSON / CSV / Google Sheets")
+# ====================== CONFIG / UI ======================
+st.set_page_config(page_title="Kannada Paper Tool Digitizer (robust)", page_icon="🧾", layout="wide")
+st.title("🧾 Kannada Paper Tool → JSON / CSV / Google Sheets (Robust)")
 
-st.markdown("""
-Upload up to **10 JPEGs** of the fixed Kannada tutoring form.
-Extracts header (**Teacher, School, UDISE, Cycle**), per-student details (**SATS, caregiver name/phone, grade**), **baseline/endline ops** (circled/ticked), **4 lessons**, and a bottom **summary**.
-
-- Phones: digits-only, **any length**
-- Baseline/Endline: **circled or tick-marked only** (no handwriting next to options)
-- Processing is **sequential**; per-file failures are shown clearly
-""")
-
-# ----------------- Sidebar -----------------
 with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("OpenAI API Key", type="password", help="Kept only in this session")
+    st.header("Setup")
+    api_key = st.text_input("OpenAI API Key", type="password")
     model = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini"], index=0)
 
-    # You can change these defaults anytime in the UI
-    default_sheet = "1rVMPiaZ5eeATiPTUJc4sQHEJMYZ8BPvsweEn7NSoFZM"
-    spreadsheet_id_input = st.text_input("Spreadsheet ID or URL (optional)", value=default_sheet)
+    st.divider()
+    st.subheader("Google Sheets (optional)")
+    spreadsheet_id_input = st.text_input("Spreadsheet ID or URL", value="16fnfCvrUBysEXtf_OAWLW1aVQSAegqtxehxwkWF3q_0")
     worksheet_name = st.text_input("Worksheet/Tab (rows)", value="sheet1")
-
-    write_rows = st.checkbox("Append student-session rows to Google Sheet", value=False)
+    write_rows = st.checkbox("Append rows to Google Sheet", value=False)
     write_footer = st.checkbox("Append bottom summary to 'summary' tab", value=False)
+
+    st.divider()
+    st.subheader("Detection controls")
+    mark_thresh = st.slider("Mark detection threshold (ink ratio)", 0.05, 0.30, 0.12, 0.01)
+    show_overlay = st.checkbox("Show debug overlay of regions", value=False)
+    extra_digit_pass = st.checkbox("Extra digit pass for SATS/phones/UDISE", value=False,
+                                   help="Crops number fields and asks the model for digits-only")
 
 uploaded = st.file_uploader("Upload JPEG files (max 10)", type=["jpg","jpeg"], accept_multiple_files=True)
 
-# ----------------- Prompt -----------------
-# Kannada-focused: asks for Kannada OCR but returns English-keyed JSON
+# ====================== CONSTANTS ======================
+ALLOWED_OPS = ["None","Addition","Subtraction","Multiplication","Division"]
+
+ROW_COLUMNS = [
+    "fileName","teacherName","schoolName","udise","cycle",
+    "studentName","sats","caregiverName","studentPhone","caregiverPhone","grade",
+    "baselineOp","session","datetime","currentTopic","checkpointCorrect","parentAttended","nextTopic","endlineOp"
+]
+
+# Student strip vertical ranges as FRACTIONS of page height (tune once if needed)
+STUDENT_STRIP_FRACS = [
+    (0.095, 0.275),   # Student 1
+    (0.285, 0.465),   # Student 2
+    (0.475, 0.655),   # Student 3
+    (0.665, 0.845),   # Student 4
+]
+
+# Within each student strip, fractional boxes for the 5 ops (baseline row band)
+# and 5 ops (endline row band). These are relative to the student strip (0..1).
+BASELINE_OP_BOXES = [
+    ("None",           0.20, 0.13, 0.27, 0.18),
+    ("Addition",       0.30, 0.13, 0.36, 0.18),
+    ("Subtraction",    0.39, 0.13, 0.47, 0.18),
+    ("Multiplication", 0.50, 0.13, 0.60, 0.18),
+    ("Division",       0.63, 0.13, 0.71, 0.18),
+]
+ENDLINE_OP_BOXES = [
+    ("None",           0.20, 0.83, 0.27, 0.88),
+    ("Addition",       0.30, 0.83, 0.36, 0.88),
+    ("Subtraction",    0.39, 0.83, 0.47, 0.88),
+    ("Multiplication", 0.50, 0.83, 0.60, 0.88),
+    ("Division",       0.63, 0.83, 0.71, 0.88),
+]
+
+# Header/field crops for the extra digit pass (fractions of full page)
+HEADER_UDISE_BOX = (0.75, 0.03, 0.96, 0.08)  # (x0,y0,x1,y1) ~ adjust if needed
+
+# Per-student tiny crops within strip (fractions of strip)
+SAT_BOX         = (0.12, 0.06, 0.28, 0.12)
+STUDENT_PHONE   = (0.33, 0.06, 0.53, 0.12)
+CAREGIVER_PHONE = (0.58, 0.06, 0.78, 0.12)
+
+# ====================== PROMPT ======================
 EXTRACTION_PROMPT = """
-You are an OCR + information extraction agent for **Kannada** handwriting. The form layout is fixed (4 student blocks).
+You are an OCR + information extraction agent for Kannada handwriting. The form layout is fixed (4 student blocks).
 
 Return ONLY a single JSON object with these keys exactly:
 {
@@ -74,100 +115,198 @@ Return ONLY a single JSON object with these keys exactly:
 }
 
 Rules:
-- Header: "teacherName", "schoolName", "udise", "cycle" (cycle is 1..5).
-- For EACH student block, extract:
-  - name (ಹೆಸರು), SATS (SATS #), caregiverName (ಪೋಷಕರ ಹೆಸರು if present),
-  - studentPhone (ದೂರವಾಣಿ ಸಂಖ್ಯೆ), caregiverPhone (ಹೆಚ್ಚುವರಿ ದೂರವಾಣಿ ಸಂಖ್ಯೆ / ಪೋಷಕರ ದೂರವಾಣಿ),
-  - grade (ತರಗತಿ).
+- Header: "teacherName", "schoolName", "udise", "cycle" (1..5).
+- For EACH student block, extract Kannada fields for name, SATS, caregiver name, student phone, caregiver phone, and grade. Phones: digits-only.
 - Baseline & Endline highest operation:
-  - Choose ONLY the option that is **circled or tick-marked** (ignore free handwriting).
+  - Look ONLY for a drawn CIRCLE or a TICK MARK over the printed options line.
+  - If you cannot clearly see exactly one circled/ticked option, set all values in baselineMarks/endlineMarks to false and leave baselineOp/endlineOp = "".
+  - DO NOT infer from nearby words, letters, or context. Absence of a visible circle/tick => blank.
   - Valid values ONLY: "None","Addition","Subtraction","Multiplication","Division".
-  - Kannada → English mapping:
-    - ಆರಂಭಿಕ → "None"
-    - ಸಂಕಲನ → "Addition"
-    - ವಿಯೋಗ / ವಿಭಜನೆ / ವಿವಕಲನ (subtract) → "Subtraction"
-    - ಗುಣಾಕಾರ → "Multiplication"
-    - ಭಾಗಾಕಾರ → "Division"
-  - In "baselineMarks" and "endlineMarks", set **true** only for the selected option(s). If none/unclear, set all false.
-  - "baselineOp"/"endlineOp" may repeat the chosen option; if none, leave "".
-- Sessions (4 rows):
-  - "session": "Lesson 1".."Lesson 4" in row order.
-  - "datetime": combine date & time as "DD/MM/YY HH:mm" (24h). If one missing, include available part.
-  - "currentTopic": copy the Kannada letter/abbrev in that column.
-  - "checkpointCorrect": "Yes" if marked correct, "No" if marked incorrect, else "".
-  - "parentAttended": "Yes" if marked that parent/caregiver attended (ಪೋಷಕರು?), "No" if marked not, else "".
-  - "nextTopic": copy what is written in that column.
-- Footer table at the bottom: for Lesson 1–4, extract numbers for "totalStudents" and "successfullyReached".
-- Phones: digits only (strip spaces, dashes, country code). Any length.
+- Kannada → English mapping for ops: ಆರಂಭಿಕ→"None"; ಸಂಕಲನ→"Addition"; ವಿಯೋಗ/ವಿವಕಲನ→"Subtraction"; ಗುಣಾಕಾರ→"Multiplication"; ಭಾಗಾಕಾರ→"Division".
+- Sessions (4 rows): "Lesson 1".."Lesson 4"; datetime "DD/MM/YY HH:mm" (24h). If only date or time present, include what you see.
+  "checkpointCorrect": "Yes"/"No"/""; "parentAttended": "Yes"/"No"/"".
+- Footer: Lesson 1–4 with "totalStudents" and "successfullyReached".
 - If a field is empty or illegible, output "".
-- Output must be **valid JSON** and contain **only** the JSON object.
+- Return **valid JSON** and **nothing else**.
 """
 
-# ----------------- OpenAI helpers -----------------
+# Tiny prompt for the extra digit pass (field crops)
+DIGITS_ONLY_PROMPT = """
+You see an image of a single form field that contains only a handwritten ID/phone number.
+Return ONLY its digits as a single string (0-9). If unreadable, return "".
+"""
+
+# ====================== OPENAI HELPERS ======================
 def make_client(key: str):
     from openai import OpenAI
     return OpenAI(api_key=key)
 
-def to_data_url_jpeg(b: bytes) -> str:
+def data_url_from_bytes(b: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(b).decode("utf-8")
 
-def call_vision_json(client, model: str, prompt: str, jpeg_bytes: bytes) -> str:
-    data_url = to_data_url_jpeg(jpeg_bytes)
+def call_json_vision(client, model: str, prompt: str, jpeg_bytes: bytes) -> str:
     resp = client.chat.completions.create(
-        model=model,
-        temperature=0,
-        response_format={"type": "json_object"},
+        model=model, temperature=0, response_format={"type": "json_object"},
         messages=[
-            {"role":"system","content":"You are a precise JSON-only extractor. Output valid JSON only."},
-            {"role":"user","content":[
-                {"type":"text","text": prompt},
-                {"type":"image_url","image_url":{"url": data_url}}
+            {"role": "system", "content": "You are a precise JSON-only extractor. Output valid JSON only."},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url_from_bytes(jpeg_bytes)}},
             ]}
         ]
     )
     return resp.choices[0].message.content
 
+def call_digits_only(client, model: str, crop_bytes: bytes) -> str:
+    resp = client.chat.completions.create(
+        model=model, temperature=0, response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "Return JSON like {\"digits\":\"...\"} with digits only."},
+            {"role": "user", "content": [
+                {"type": "text", "text": DIGITS_ONLY_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url_from_bytes(crop_bytes)}},
+            ]}
+        ]
+    )
+    txt = resp.choices[0].message.content.strip()
+    try:
+        return json.loads(txt).get("digits","")
+    except Exception:
+        # soft fallback
+        return re.sub(r"\D", "", txt)
+
 def safe_json_loads(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-    if "{" in text and "}" in text:
-        text = text[text.find("{"): text.rfind("}")+1]
-    return json.loads(text)
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t.lower().startswith("json"):
+            t = t[4:]
+    if "{" in t and "}" in t:
+        t = t[t.find("{"): t.rfind("}")+1]
+    return json.loads(t)
 
-# ----------------- Row shaping -----------------
-ALLOWED_OPS = ["None","Addition","Subtraction","Multiplication","Division"]
+# ====================== IMAGE PREPROCESS ======================
+def preprocess_for_ocr(file) -> Tuple[bytes, np.ndarray, np.ndarray]:
+    """
+    Returns (jpeg_bytes, bin_gray_image, color_image_for_overlay)
+    """
+    raw = np.frombuffer(file.read(), np.uint8)
+    img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
 
-ROW_COLUMNS = [
-    "fileName","teacherName","schoolName","udise","cycle",
-    "studentName","sats","caregiverName","studentPhone","caregiverPhone","grade",
-    "baselineOp","session","datetime","currentTopic","checkpointCorrect","parentAttended","nextTopic","endlineOp"
-]
+    # 1) detect page and warp to top-down
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        page = max(cnts, key=cv2.contourArea)
+        peri = cv2.arcLength(page, True)
+        approx = cv2.approxPolyDP(page, 0.02*peri, True)
+        if len(approx) == 4:
+            pts = approx.reshape(4,2).astype(np.float32)
+            s = pts.sum(axis=1); diff = np.diff(pts, axis=1).ravel()
+            ordered = np.array([pts[np.argmin(s)], pts[np.argmin(diff)], pts[np.argmax(s)], pts[np.argmax(diff)]], dtype=np.float32)
+            tl, tr, br, bl = ordered
+            widthA = np.linalg.norm(br - bl); widthB = np.linalg.norm(tr - tl)
+            heightA = np.linalg.norm(tr - br); heightB = np.linalg.norm(tl - bl)
+            maxW = int(max(widthA, widthB)); maxH = int(max(heightA, heightB))
+            M = cv2.getPerspectiveTransform(ordered, np.array([[0,0],[maxW-1,0],[maxW-1,maxH-1],[0,maxH-1]], dtype=np.float32))
+            img = cv2.warpPerspective(img, M, (maxW, maxH))
 
-def pick_from_marks(m: dict) -> str:
-    if not isinstance(m, dict):
-        return ""
-    trues = [k for k, v in m.items() if isinstance(v, bool) and v]
-    return trues[0] if len(trues) == 1 else ""
+    color = img.copy()
+
+    # 2) enhance + binarize
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g = clahe.apply(g)
+    th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 11)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8))
+
+    # 3) encode JPEG
+    pil = Image.fromarray(th)
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=95)
+    return buf.getvalue(), th, color
+
+# ====================== CV MARK DETECTION ======================
+def pick_op_by_ink(block_bin: np.ndarray, op_boxes: List[Tuple[str,float,float,float,float]], thresh: float) -> str:
+    h, w = block_bin.shape[:2]
+    best_label, best_ink = "", 0.0
+    for label, x0, y0, x1, y1 in op_boxes:
+        rx0, ry0, rx1, ry1 = int(x0*w), int(y0*h), int(x1*w), int(y1*h)
+        roi = block_bin[ry0:ry1, rx0:rx1]
+        if roi.size == 0:
+            continue
+        ink_ratio = 1.0 - (roi.mean()/255.0)  # darker => more ink
+        if ink_ratio > best_ink:
+            best_label, best_ink = label, ink_ratio
+    return best_label if best_ink >= thresh else ""
+
+def compute_cv_ops(bin_img: np.ndarray, overlay_img: np.ndarray, thresh: float, show_overlay: bool):
+    H, W = bin_img.shape[:2]
+    cv_ops = {}
+    vis = overlay_img.copy()
+
+    for idx, (yf0, yf1) in enumerate(STUDENT_STRIP_FRACS, start=1):
+        y0, y1 = int(yf0*H), int(yf1*H)
+        block = bin_img[y0:y1, :]
+        base = pick_op_by_ink(block, BASELINE_OP_BOXES, thresh)
+        end = pick_op_by_ink(block, ENDLINE_OP_BOXES, thresh)
+        cv_ops[idx] = {"baselineOp": base or "", "endlineOp": end or ""}
+
+        if show_overlay:
+            # draw student strip
+            cv2.rectangle(vis, (0, y0), (W-1, y1), (0, 255, 0), 2)
+            # draw op boxes
+            for (label, x0, y0f, x1, y1f) in BASELINE_OP_BOXES + ENDLINE_OP_BOXES:
+                bx0, by0 = int(x0*W), int((y0f*(y1-y0) + y0))
+                bx1, by1 = int(x1*W), int((y1f*(y1-y0) + y0))
+                cv2.rectangle(vis, (bx0, by0), (bx1, by1), (255, 0, 0), 1)
+                if label == base or label == end:
+                    cv2.rectangle(vis, (bx0, by0), (bx1, by1), (0, 0, 255), 2)
+
+    return cv_ops, vis
+
+# ====================== UTILITIES ======================
+def digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+def normalize_student_numbers(s: Dict[str, Any]) -> Dict[str, Any]:
+    s["sats"] = digits_only(s.get("sats",""))
+    s["studentPhone"] = digits_only(s.get("studentPhone",""))
+    s["caregiverPhone"] = digits_only(s.get("caregiverPhone",""))
+    return s
+
+def sanitize_spreadsheet_id(text: str) -> str:
+    m = re.search(r"/d/([a-zA-Z0-9-_]+)", text)
+    return m.group(1) if m else text.split("?")[0].split("#")[0].strip()
+
+def footer_to_df(obj: Dict[str, Any], file_name: str) -> pd.DataFrame:
+    f = obj.get("footer",{}) or {}
+    recs = []
+    for i, key in enumerate(["lesson1","lesson2","lesson3","lesson4"], start=1):
+        v = f.get(key, {}) or {}
+        recs.append({
+            "fileName": file_name,
+            "lesson": f"Lesson {i}",
+            "totalStudents": str(v.get("totalStudents","") or ""),
+            "successfullyReached": str(v.get("successfullyReached","") or "")
+        })
+    return pd.DataFrame(recs)
 
 def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     teacher = obj.get("teacherName","") or ""
     school  = obj.get("schoolName","") or ""
-    udise   = obj.get("udise","") or ""
+    udise   = digits_only(obj.get("udise","") or "")
     cycle   = obj.get("cycle","") or ""
     students = obj.get("students",[]) or []
 
     for s in students:
-        derived_baseline = pick_from_marks(s.get("baselineMarks", {}))
-        derived_endline  = pick_from_marks(s.get("endlineMarks", {}))
-        baseline_str = s.get("baselineOp","") or ""
-        endline_str  = s.get("endlineOp","") or ""
-
-        baseline_op = derived_baseline or (baseline_str if baseline_str in ALLOWED_OPS else "")
-        endline_op  = derived_endline  or (endline_str  if endline_str  in ALLOWED_OPS else "")
+        s = normalize_student_numbers(s)
+        baseline_op = s.get("baselineOp","") if s.get("baselineOp","") in ALLOWED_OPS else ""
+        endline_op  = s.get("endlineOp","")  if s.get("endlineOp","")  in ALLOWED_OPS else ""
 
         base = {
             "fileName": file_name,
@@ -178,8 +317,8 @@ def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
             "studentName": s.get("name","") or "",
             "sats": s.get("sats","") or "",
             "caregiverName": s.get("caregiverName","") or "",
-            "studentPhone": "".join(ch for ch in (s.get("studentPhone","") or "") if ch.isdigit()),
-            "caregiverPhone": "".join(ch for ch in (s.get("caregiverPhone","") or "") if ch.isdigit()),
+            "studentPhone": s.get("studentPhone","") or "",
+            "caregiverPhone": s.get("caregiverPhone","") or "",
             "grade": s.get("grade","") or "",
             "baselineOp": baseline_op,
             "endlineOp": endline_op,
@@ -201,33 +340,16 @@ def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
             rows.append(row)
             wrote_any = True
 
-        if not wrote_any:  # write a baseline-only row so student isn't lost
-            rows.append({**base, "session":"", "datetime":"", "currentTopic":"", "checkpointCorrect":"", "parentAttended":"", "nextTopic":""})
+        if not wrote_any:
+            rows.append({**base, "session":"", "datetime":"", "currentTopic":"",
+                         "checkpointCorrect":"", "parentAttended":"", "nextTopic":""})
 
-    # keep column order
     for r in rows:
         for col in ROW_COLUMNS:
-            r.setdefault(col, "")
+            r.setdefault(col,"")
     return rows
 
-def footer_to_df(obj: Dict[str, Any], file_name: str) -> pd.DataFrame:
-    f = obj.get("footer",{}) or {}
-    recs = []
-    for i, key in enumerate(["lesson1","lesson2","lesson3","lesson4"], start=1):
-        v = f.get(key, {}) or {}
-        recs.append({
-            "fileName": file_name,
-            "lesson": f"Lesson {i}",
-            "totalStudents": str(v.get("totalStudents","") or ""),
-            "successfullyReached": str(v.get("successfullyReached","") or "")
-        })
-    return pd.DataFrame(recs)
-
-# ----------------- Google Sheets -----------------
-def sanitize_spreadsheet_id(text: str) -> str:
-    m = re.search(r"/d/([a-zA-Z0-9-_]+)", text)
-    return m.group(1) if m else text.split("?")[0].split("#")[0].strip()
-
+# Sheets helpers
 def get_sheets_client():
     if not HAS_SHEETS:
         raise RuntimeError("gspread not installed.")
@@ -270,14 +392,7 @@ def write_footer_to_summary(df_footer: pd.DataFrame, spreadsheet_id: str):
         df_footer = df_footer[cols]
     append_df(ws, df_footer)
 
-# ----------------- Image utils -----------------
-def ensure_jpeg(file) -> bytes:
-    img = Image.open(file).convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
-    return buf.getvalue()
-
-# ----------------- Main -----------------
+# ====================== MAIN ======================
 if uploaded:
     if len(uploaded) > 10:
         st.error("Please upload 10 or fewer JPEG files.")
@@ -289,26 +404,91 @@ if uploaded:
     from openai import OpenAI
     client = make_client(api_key)
 
-    prog = st.progress(0)
+    progress = st.progress(0)
     status = st.empty()
 
     all_rows: List[Dict[str, Any]] = []
     all_footer = []
     failures: List[str] = []
+    debug_images = []
 
     for i, f in enumerate(uploaded, start=1):
         status.info(f"Processing {f.name} ({i}/{len(uploaded)}) ...")
         try:
-            jpeg = ensure_jpeg(f)
-            raw = call_vision_json(client, model=model, prompt=EXTRACTION_PROMPT, jpeg_bytes=jpeg)
+            # Preprocess
+            jpeg_bytes, bin_img, overlay_img = preprocess_for_ocr(f)
+
+            # Deterministic circled/ticked detection (before model)
+            cv_ops, vis = compute_cv_ops(bin_img, overlay_img, thresh=mark_thresh, show_overlay=show_overlay)
+            if show_overlay:
+                debug_images.append((f.name, vis[:, :, ::-1]))  # BGR->RGB
+
+            # Call model for main JSON
+            raw = call_json_vision(client, model=model, prompt=EXTRACTION_PROMPT, jpeg_bytes=jpeg_bytes)
             obj = safe_json_loads(raw)
+
+            # Override ops with CV results (never guess)
+            for idx, stu in enumerate(obj.get("students", []), start=1):
+                if idx in cv_ops:
+                    for which in ["baselineOp","endlineOp"]:
+                        label = cv_ops[idx][which]
+                        if label:
+                            stu[which] = label
+                            marks = {k:(k==label) for k in ALLOWED_OPS}
+                        else:
+                            stu[which] = ""
+                            marks = {k: False for k in ALLOWED_OPS}
+                        if which == "baselineOp":
+                            stu["baselineMarks"] = marks
+                        else:
+                            stu["endlineMarks"] = marks
+
+            # Optional extra digit pass (crops)
+            if extra_digit_pass:
+                H, W = bin_img.shape[:2]
+                # Header UDISE
+                x0, y0, x1, y1 = HEADER_UDISE_BOX
+                crop = bin_img[int(y0*H):int(y1*H), int(x0*W):int(x1*W)]
+                if crop.size > 0:
+                    buff = io.BytesIO()
+                    Image.fromarray(crop).save(buff, format="JPEG", quality=95)
+                    try:
+                        digits = call_digits_only(client, model, buff.getvalue())
+                        if digits:
+                            obj["udise"] = digits
+                    except Exception:
+                        pass
+
+                # Per-student digits
+                for idx, (yf0, yf1) in enumerate(STUDENT_STRIP_FRACS, start=1):
+                    if idx-1 < len(obj.get("students", [])):
+                        stu = obj["students"][idx-1]
+                        y0p, y1p = int(yf0*H), int(yf1*H)
+                        for label, (x0, y0, x1, y1) in [
+                            ("sats", SAT_BOX), ("studentPhone", STUDENT_PHONE), ("caregiverPhone", CAREGIVER_PHONE)
+                        ]:
+                            cx0, cy0 = int(x0*W), int(y0*(y1p-y0p) + y0p)
+                            cx1, cy1 = int(x1*W), int(y1*(y1p-y0p) + y0p)
+                            crop = bin_img[cy0:cy1, cx0:cx1]
+                            if crop.size > 0:
+                                buff = io.BytesIO()
+                                Image.fromarray(crop).save(buff, format="JPEG", quality=95)
+                                try:
+                                    digits = call_digits_only(client, model, buff.getvalue())
+                                    if digits:
+                                        stu[label] = digits
+                                except Exception:
+                                    pass
+
+            # Shape rows
             rows = flatten_rows(obj, f.name)
             all_rows.extend(rows)
             all_footer.append(footer_to_df(obj, f.name))
+
         except Exception as e:
             failures.append(f"{f.name}: {str(e)[:220]}")
         finally:
-            prog.progress(int(i * 100 / len(uploaded)))
+            progress.progress(int(i*100/len(uploaded)))
             time.sleep(0.05)
 
     status.empty()
@@ -336,7 +516,7 @@ if uploaded:
         else:
             df_footer = pd.DataFrame(columns=["fileName","lesson","totalStudents","successfullyReached"])
 
-        # Sheets
+        # Sheets write
         if write_rows or write_footer:
             try:
                 sid = sanitize_spreadsheet_id(spreadsheet_id_input)
@@ -349,6 +529,13 @@ if uploaded:
             except Exception as e:
                 st.error(f"Google Sheets append failed: {e}")
     else:
-        st.warning("No rows extracted. Check image quality and ensure it matches the Kannada template.")
+        st.warning("No rows extracted. Check image quality and that it matches the Kannada template.")
+
+    # Debug overlays
+    if show_overlay and debug_images:
+        st.subheader("Detection overlays")
+        for name, img_rgb in debug_images:
+            st.image(img_rgb, caption=name, use_column_width=True)
+
 else:
     st.info("Upload JPEG files to begin.")
