@@ -28,7 +28,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Google Sheets (optional)")
-    spreadsheet_id_input = st.text_input("Spreadsheet ID or URL", value="16fnfCvrUBysEXtf_OAWLW1aVQSAegqtxehxwkWF3q_0")
+    spreadsheet_id_input = st.text_input("Spreadsheet ID or URL", value="1rVMPiaZ5eeATiPTUJc4sQHEJMYZ8BPvsweEn7NSoFZM")
     worksheet_name = st.text_input("Worksheet/Tab (rows)", value="sheet1")
     write_rows = st.checkbox("Append rows to Google Sheet", value=False)
     write_footer = st.checkbox("Append bottom summary to 'summary' tab", value=False)
