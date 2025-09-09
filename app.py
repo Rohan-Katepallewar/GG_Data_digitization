@@ -18,8 +18,8 @@ except Exception:
     HAS_SHEETS = False
 
 # ====================== CONFIG / UI ======================
-st.set_page_config(page_title="Kannada Paper Tool Digitizer (robust)", page_icon="🧾", layout="wide")
-st.title("🧾 Kannada Paper Tool → JSON / CSV / Google Sheets (Robust)")
+st.set_page_config(page_title="Kannada Paper Tool Digitizer (HIL)", page_icon="🧾", layout="wide")
+st.title("🧾 Kannada Paper Tool → JSON / CSV / Google Sheets (Human-in-the-loop)")
 
 with st.sidebar:
     st.header("Setup")
@@ -30,8 +30,6 @@ with st.sidebar:
     st.subheader("Google Sheets (optional)")
     spreadsheet_id_input = st.text_input("Spreadsheet ID or URL", value="1rVMPiaZ5eeATiPTUJc4sQHEJMYZ8BPvsweEn7NSoFZM")
     worksheet_name = st.text_input("Worksheet/Tab (rows)", value="sheet1")
-    write_rows = st.checkbox("Append rows to Google Sheet", value=False)
-    write_footer = st.checkbox("Append bottom summary to 'summary' tab", value=False)
 
     st.divider()
     st.subheader("Detection controls")
@@ -44,6 +42,8 @@ uploaded = st.file_uploader("Upload JPEG files (max 10)", type=["jpg","jpeg"], a
 
 # ====================== CONSTANTS ======================
 ALLOWED_OPS = ["None","Addition","Subtraction","Multiplication","Division"]
+EDIT_OPS = ["", "Addition","Subtraction","Multiplication","Division"]  # for editing dropdowns
+EDIT_YN  = ["", "Yes","No"]
 
 ROW_COLUMNS = [
     "fileName","teacherName","schoolName","udise","cycle",
@@ -77,14 +77,14 @@ ENDLINE_OP_BOXES = [
 ]
 
 # Header/field crops for the extra digit pass (fractions of full page)
-HEADER_UDISE_BOX = (0.75, 0.03, 0.96, 0.08)  # (x0,y0,x1,y1) ~ adjust if needed
+HEADER_UDISE_BOX = (0.75, 0.03, 0.96, 0.08)
 
 # Per-student tiny crops within strip (fractions of strip)
 SAT_BOX         = (0.12, 0.06, 0.28, 0.12)
 STUDENT_PHONE   = (0.33, 0.06, 0.53, 0.12)
 CAREGIVER_PHONE = (0.58, 0.06, 0.78, 0.12)
 
-# ====================== PROMPT ======================
+# ====================== PROMPTS ======================
 EXTRACTION_PROMPT = """
 You are an OCR + information extraction agent for Kannada handwriting. The form layout is fixed (4 student blocks).
 
@@ -121,7 +121,7 @@ Rules:
   - Look ONLY for a drawn CIRCLE or a TICK MARK over the printed options line.
   - If you cannot clearly see exactly one circled/ticked option, set all values in baselineMarks/endlineMarks to false and leave baselineOp/endlineOp = "".
   - DO NOT infer from nearby words, letters, or context. Absence of a visible circle/tick => blank.
-  - Valid values ONLY: "None","Addition","Subtraction","Multiplication","Division".
+  - Valid values ONLY: "Beginner","Addition","Subtraction","Multiplication","Division".
 - Kannada → English mapping for ops: ಆರಂಭಿಕ→"None"; ಸಂಕಲನ→"Addition"; ವಿಯೋಗ/ವಿವಕಲನ→"Subtraction"; ಗುಣಾಕಾರ→"Multiplication"; ಭಾಗಾಕಾರ→"Division".
 - Sessions (4 rows): "Lesson 1".."Lesson 4"; datetime "DD/MM/YY HH:mm" (24h). If only date or time present, include what you see.
   "checkpointCorrect": "Yes"/"No"/""; "parentAttended": "Yes"/"No"/"".
@@ -130,7 +130,6 @@ Rules:
 - Return **valid JSON** and **nothing else**.
 """
 
-# Tiny prompt for the extra digit pass (field crops)
 DIGITS_ONLY_PROMPT = """
 You see an image of a single form field that contains only a handwritten ID/phone number.
 Return ONLY its digits as a single string (0-9). If unreadable, return "".
@@ -172,7 +171,6 @@ def call_digits_only(client, model: str, crop_bytes: bytes) -> str:
     try:
         return json.loads(txt).get("digits","")
     except Exception:
-        # soft fallback
         return re.sub(r"\D", "", txt)
 
 def safe_json_loads(text: str) -> Dict[str, Any]:
@@ -500,34 +498,87 @@ if uploaded:
     if all_rows:
         df_rows = pd.DataFrame(all_rows)[ROW_COLUMNS]
         st.success(f"Digitized {len(df_rows)} row(s) from {len(uploaded)-len(failures)} file(s).")
-        st.dataframe(df_rows, use_container_width=True)
 
-        st.download_button("Download CSV (rows)",
-                           df_rows.to_csv(index=False).encode("utf-8"),
-                           "kannada_rows.csv","text/csv")
+        # ===== Human-in-the-loop editor =====
+        st.subheader("Review & edit (only these columns are editable)")
+        editable_cols = ["currentTopic","nextTopic","checkpointCorrect"]
 
+        # Restrict select options
+        op_col = st.column_config.SelectboxColumn(
+            "Operation", options=EDIT_OPS, help="Choose the operation or leave blank"
+        )
+        yn_col = st.column_config.SelectboxColumn(
+            "Checkpoint Correct", options=EDIT_YN, help="Choose Yes/No or leave blank"
+        )
+
+        edited_df = st.data_editor(
+            df_rows,
+            column_config={
+                "currentTopic": op_col,
+                "nextTopic": op_col,
+                "checkpointCorrect": yn_col
+            },
+            disabled=[c for c in df_rows.columns if c not in editable_cols],
+            use_container_width=True,
+            hide_index=True,
+            key="editor",
+        )
+
+        # Normalize edited values (case/aliases)
+        def norm_op(v: str) -> str:
+            v = (v or "").strip().lower()
+            m = {
+                "addition":"Addition","add":"Addition","+":"Addition","a":"Addition",
+                "subtraction":"Subtraction","minus":"Subtraction","-":"Subtraction","s":"Subtraction",
+                "multiplication":"Multiplication","times":"Multiplication","x":"Multiplication","m":"Multiplication",
+                "division":"Division","divide":"Division","/":"Division","d":"Division",
+                "":""
+            }
+            return m.get(v, v.title() if v.title() in EDIT_OPS else "")
+
+        def norm_yn(v: str) -> str:
+            v = (v or "").strip().lower()
+            if v in ("yes","y","true","1"): return "Yes"
+            if v in ("no","n","false","0"): return "No"
+            return ""
+
+        edited_df["currentTopic"] = edited_df["currentTopic"].apply(norm_op)
+        edited_df["nextTopic"]     = edited_df["nextTopic"].apply(norm_op)
+        edited_df["checkpointCorrect"] = edited_df["checkpointCorrect"].apply(norm_yn)
+
+        st.download_button("Download CSV (edited rows)",
+                           edited_df.to_csv(index=False).encode("utf-8"),
+                           "kannada_rows_edited.csv","text/csv")
+
+        # Sheets push button (explicit)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            push_btn = st.button("Push EDITED rows to Google Sheet", type="primary")
+        with col_b:
+            push_summary_btn = st.button("Push summary to 'summary' tab")
+
+        if push_btn:
+            try:
+                sid = sanitize_spreadsheet_id(spreadsheet_id_input)
+                write_rows_to_sheets(edited_df, spreadsheet_id=sid, tab=worksheet_name)
+                st.success(f"Appended {len(edited_df)} edited rows to '{worksheet_name}'.")
+            except Exception as e:
+                st.error(f"Google Sheets append failed: {e}")
+
+        # Footer (unchanged, optional)
         if all_footer:
             df_footer = pd.concat(all_footer, ignore_index=True)
             with st.expander("Bottom summary (lesson-wise)"):
                 st.dataframe(df_footer, use_container_width=True)
-            st.download_button("Download CSV (summary)",
-                               df_footer.to_csv(index=False).encode("utf-8"),
-                               "kannada_summary.csv","text/csv")
-        else:
-            df_footer = pd.DataFrame(columns=["fileName","lesson","totalStudents","successfullyReached"])
 
-        # Sheets write
-        if write_rows or write_footer:
-            try:
-                sid = sanitize_spreadsheet_id(spreadsheet_id_input)
-                if write_rows:
-                    write_rows_to_sheets(df_rows, spreadsheet_id=sid, tab=worksheet_name)
-                    st.success(f"Appended {len(df_rows)} rows to '{worksheet_name}'.")
-                if write_footer and not df_footer.empty:
+            if push_summary_btn:
+                try:
+                    sid = sanitize_spreadsheet_id(spreadsheet_id_input)
                     write_footer_to_summary(df_footer, spreadsheet_id=sid)
                     st.success("Appended summary rows to 'summary' tab.")
-            except Exception as e:
-                st.error(f"Google Sheets append failed: {e}")
+                except Exception as e:
+                    st.error(f"Google Sheets append failed: {e}")
+
     else:
         st.warning("No rows extracted. Check image quality and that it matches the Kannada template.")
 
