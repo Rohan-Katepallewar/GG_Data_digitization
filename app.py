@@ -121,10 +121,18 @@ Rules:
   - Look ONLY for a drawn CIRCLE or a TICK MARK over the printed options line.
   - If you cannot clearly see exactly one circled/ticked option, set all values in baselineMarks/endlineMarks to false and leave baselineOp/endlineOp = "".
   - DO NOT infer from nearby words, letters, or context. Absence of a visible circle/tick => blank.
-  - Valid values ONLY: "Beginner","Addition","Subtraction","Multiplication","Division".
+  - Valid values ONLY: "None","Addition","Subtraction","Multiplication","Division".
 - Kannada → English mapping for ops: ಆರಂಭಿಕ→"None"; ಸಂಕಲನ→"Addition"; ವಿಯೋಗ/ವಿವಕಲನ→"Subtraction"; ಗುಣಾಕಾರ→"Multiplication"; ಭಾಗಾಕಾರ→"Division".
-- Sessions (4 rows): "Lesson 1".."Lesson 4"; datetime "DD/MM/YY HH:mm" (24h). If only date or time present, include what you see.
-  "checkpointCorrect": "Yes"/"No"/""; "parentAttended": "Yes"/"No"/"".
+- Sessions (4 rows):
+  - "session": "Lesson 1".."Lesson 4"; "datetime": "DD/MM/YY HH:mm" (24h). If only date or time present, include what you see.
+  - **currentTopic & nextTopic MUST be one of these exact strings only**:
+      "Addition","Subtraction","Multiplication","Division".
+    Map whatever is written in the cell — Kannada word (e.g., ಸಂಕಲನ/ವಿಯೋಗ/ಗುಣಾಕಾರ/ಭಾಗಾಕಾರ),
+    Kannada abbreviations, English words (add/sub/mul/div), single letters (A/S/M/D),
+    or symbols (+/−/×/÷) — to the correct string above. Prefer NOT to leave blank if there is any mark or text.
+    If the cell is clearly empty, use "".
+  - "checkpointCorrect": "Yes" if marked correct, "No" if marked incorrect, else "".
+  - "parentAttended": "Yes"/"No"/"".
 - Footer: Lesson 1–4 with "totalStudents" and "successfullyReached".
 - If a field is empty or illegible, output "".
 - Return **valid JSON** and **nothing else**.
@@ -293,6 +301,48 @@ def footer_to_df(obj: Dict[str, Any], file_name: str) -> pd.DataFrame:
         })
     return pd.DataFrame(recs)
 
+# Canonical ops for UI/editor
+CANONICAL_OPS = {"Addition","Subtraction","Multiplication","Division"}
+
+# Rich mapping: Kannada, letters, symbols, English variants
+_OP_MAP = {
+    # Kannada full words
+    "ಸಂಕಲನ":"Addition", "ಜೋಡಣೆ":"Addition",
+    "ವಿಯೋಗ":"Subtraction", "ಕಳೆಯುವುದು":"Subtraction", "ವಿವಕಲನ":"Subtraction",
+    "ಗುಣಾಕಾರ":"Multiplication",
+    "ಭಾಗಾಕಾರ":"Division", "ಭಾಗ":"Division",
+
+    # English words/abbrevs
+    "addition":"Addition","add":"Addition","sum":"Addition","plus":"Addition",
+    "subtraction":"Subtraction","subtract":"Subtraction","minus":"Subtraction","sub":"Subtraction",
+    "multiplication":"Multiplication","multiply":"Multiplication","times":"Multiplication","mul":"Multiplication",
+    "division":"Division","divide":"Division","div":"Division",
+
+    # single letters
+    "a":"Addition","s":"Subtraction","m":"Multiplication","d":"Division",
+
+    # symbols
+    "+":"Addition","-":"Subtraction","×":"Multiplication","x":"Multiplication","*":"Multiplication","÷":"Division","/":"Division",
+
+    # common short-hands
+    "addn":"Addition","subs":"Subtraction"
+}
+
+def coerce_op(val: str) -> str:
+    if not val: 
+        return ""
+    v = str(val).strip().lower()
+    # quick exact map
+    if v in _OP_MAP:
+        return _OP_MAP[v]
+    # try to clean stray dots and case (e.g., "A.", "m," etc.)
+    v2 = re.sub(r"[^a-z+\-x*/×÷/ಅ-ಹ]", "", v)  # keep letters/symbols/Kannada range
+    if v2 in _OP_MAP:
+        return _OP_MAP[v2]
+    # title-case if it's already a canonical word
+    vt = v.title()
+    return vt if vt in CANONICAL_OPS else ""
+
 def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     teacher = obj.get("teacherName","") or ""
@@ -328,13 +378,15 @@ def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
             if not any((sess.get("datetime"), sess.get("currentTopic"),
                         sess.get("checkpointCorrect"), sess.get("parentAttended"), sess.get("nextTopic"))):
                 continue
+            ct_raw = sess.get("currentTopic","") or ""
+            nt_raw = sess.get("nextTopic","") or ""
             row = {**base,
                    "session": f"Lesson {idx}",
                    "datetime": sess.get("datetime","") or "",
-                   "currentTopic": sess.get("currentTopic","") or "",
+                   "currentTopic": coerce_op(ct_raw),
                    "checkpointCorrect": sess.get("checkpointCorrect","") or "",
                    "parentAttended": sess.get("parentAttended","") or "",
-                   "nextTopic": sess.get("nextTopic","") or ""}
+                   "nextTopic": coerce_op(nt_raw)}
             rows.append(row)
             wrote_any = True
 
@@ -526,16 +578,8 @@ if uploaded:
 
         # Normalize edited values (case/aliases)
         def norm_op(v: str) -> str:
-            v = (v or "").strip().lower()
-            m = {
-                "addition":"Addition","add":"Addition","+":"Addition","a":"Addition",
-                "subtraction":"Subtraction","minus":"Subtraction","-":"Subtraction","s":"Subtraction",
-                "multiplication":"Multiplication","times":"Multiplication","x":"Multiplication","m":"Multiplication",
-                "division":"Division","divide":"Division","/":"Division","d":"Division",
-                "":""
-            }
-            return m.get(v, v.title() if v.title() in EDIT_OPS else "")
-
+        # Reuse the same logic used for model outputs
+        return coerce_op(v)
         def norm_yn(v: str) -> str:
             v = (v or "").strip().lower()
             if v in ("yes","y","true","1"): return "Yes"
