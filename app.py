@@ -301,16 +301,17 @@ def footer_to_df(obj: Dict[str, Any], file_name: str) -> pd.DataFrame:
         })
     return pd.DataFrame(recs)
 
-# Canonical ops for UI/editor
-CANONICAL_OPS = {"Addition","Subtraction","Multiplication","Division"}
+# ---- Canonicalization helpers (place above flatten_rows) ----
+import re
 
-# Rich mapping: Kannada, letters, symbols, English variants
+CANONICAL_OPS = {"Addition", "Subtraction", "Multiplication", "Division"}
+
 _OP_MAP = {
     # Kannada full words
-    "ಸಂಕಲನ":"Addition", "ಜೋಡಣೆ":"Addition",
-    "ವಿಯೋಗ":"Subtraction", "ಕಳೆಯುವುದು":"Subtraction", "ವಿವಕಲನ":"Subtraction",
-    "ಗುಣಾಕಾರ":"Multiplication",
-    "ಭಾಗಾಕಾರ":"Division", "ಭಾಗ":"Division",
+    "ಸಂಕಲನ": "Addition", "ಜೋಡಣೆ": "Addition",
+    "ವಿಯೋಗ": "Subtraction", "ವಿವಕಲನ": "Subtraction", "ಕಳೆಯುವುದು": "Subtraction",
+    "ಗುಣಾಕಾರ": "Multiplication",
+    "ಭಾಗಾಕಾರ": "Division", "ಭಾಗ": "Division",
 
     # English words/abbrevs
     "addition":"Addition","add":"Addition","sum":"Addition","plus":"Addition",
@@ -329,19 +330,22 @@ _OP_MAP = {
 }
 
 def coerce_op(val: str) -> str:
-    if not val: 
+    """Map any variant (Kannada/letter/symbol) to the canonical op or ''."""
+    if not val:
         return ""
     v = str(val).strip().lower()
-    # quick exact map
     if v in _OP_MAP:
         return _OP_MAP[v]
-    # try to clean stray dots and case (e.g., "A.", "m," etc.)
-    v2 = re.sub(r"[^a-z+\-x*/×÷/ಅ-ಹ]", "", v)  # keep letters/symbols/Kannada range
+    # keep only letters/symbols/Kannada range, then try again
+    v2 = re.sub(r"[^a-z+\-x*/×÷/ಅ-ಹ]", "", v)
     if v2 in _OP_MAP:
         return _OP_MAP[v2]
-    # title-case if it's already a canonical word
     vt = v.title()
     return vt if vt in CANONICAL_OPS else ""
+
+def norm_op(v: str) -> str:
+    # Use the same canonicalization for human edits
+    return coerce_op(v)
 
 def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
