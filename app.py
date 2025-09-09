@@ -6,10 +6,14 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-# CV
-import cv2
+# ---- Try OpenCV; fallback if unavailable (build speed on Streamlit Cloud) ----
+try:
+    import cv2
+    CV_OK = True
+except Exception:
+    CV_OK = False
 
-# Optional Sheets
+# ---- Optional Google Sheets ----
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -17,7 +21,7 @@ try:
 except Exception:
     HAS_SHEETS = False
 
-# ====================== CONFIG / UI ======================
+# ====================== STREAMLIT UI CONFIG ======================
 st.set_page_config(page_title="Kannada Paper Tool Digitizer (HIL)", page_icon="🧾", layout="wide")
 st.title("🧾 Kannada Paper Tool → JSON / CSV / Google Sheets (Human-in-the-loop)")
 
@@ -42,7 +46,7 @@ uploaded = st.file_uploader("Upload JPEG files (max 10)", type=["jpg","jpeg"], a
 
 # ====================== CONSTANTS ======================
 ALLOWED_OPS = ["None","Addition","Subtraction","Multiplication","Division"]
-EDIT_OPS = ["", "Addition","Subtraction","Multiplication","Division"]  # for editing dropdowns
+EDIT_OPS = ["", "Addition","Subtraction","Multiplication","Division"]
 EDIT_YN  = ["", "Yes","No"]
 
 ROW_COLUMNS = [
@@ -151,35 +155,55 @@ def make_client(key: str):
 def data_url_from_bytes(b: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(b).decode("utf-8")
 
-def call_json_vision(client, model: str, prompt: str, jpeg_bytes: bytes) -> str:
-    resp = client.chat.completions.create(
-        model=model, temperature=0, response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "You are a precise JSON-only extractor. Output valid JSON only."},
-            {"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": data_url_from_bytes(jpeg_bytes)}},
-            ]}
-        ]
-    )
-    return resp.choices[0].message.content
+def call_json_vision(client, model: str, prompt: str, jpeg_bytes: bytes, timeout_sec: int = 45) -> str:
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role":"system","content":"You are a precise JSON-only extractor. Output valid JSON only."},
+                    {"role":"user","content":[
+                        {"type":"text","text": prompt},
+                        {"type":"image_url","image_url":{"url": data_url_from_bytes(jpeg_bytes)}}
+                    ]}
+                ],
+                timeout=timeout_sec,
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"OpenAI vision call failed after retries: {last_err}")
 
-def call_digits_only(client, model: str, crop_bytes: bytes) -> str:
-    resp = client.chat.completions.create(
-        model=model, temperature=0, response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "Return JSON like {\"digits\":\"...\"} with digits only."},
-            {"role": "user", "content": [
-                {"type": "text", "text": DIGITS_ONLY_PROMPT},
-                {"type": "image_url", "image_url": {"url": data_url_from_bytes(crop_bytes)}},
-            ]}
-        ]
-    )
-    txt = resp.choices[0].message.content.strip()
-    try:
-        return json.loads(txt).get("digits","")
-    except Exception:
-        return re.sub(r"\D", "", txt)
+def call_digits_only(client, model: str, crop_bytes: bytes, timeout_sec: int = 30) -> str:
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": "Return JSON like {\"digits\":\"...\"} with digits only."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": DIGITS_ONLY_PROMPT},
+                        {"type": "image_url", "image_url": {"url": data_url_from_bytes(crop_bytes)}},
+                    ]}
+                ],
+                timeout=timeout_sec,
+            )
+            txt = resp.choices[0].message.content.strip()
+            try:
+                return json.loads(txt).get("digits","")
+            except Exception:
+                return re.sub(r"\D", "", txt)
+        except Exception as e:
+            last_err = e
+            time.sleep(1.2 * (attempt + 1))
+    raise RuntimeError(f"OpenAI digits call failed after retries: {last_err}")
 
 def safe_json_loads(text: str) -> Dict[str, Any]:
     t = text.strip()
@@ -194,46 +218,85 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
 # ====================== IMAGE PREPROCESS ======================
 def preprocess_for_ocr(file) -> Tuple[bytes, np.ndarray, np.ndarray]:
     """
-    Returns (jpeg_bytes, bin_gray_image, color_image_for_overlay)
+    Returns (api_jpeg_bytes_color_small, bin_gray_image, color_image_for_overlay)
+    - Sends small COLOR JPEG to OpenAI (faster, clearer)
+    - Keeps binarized image for CV mark detection / overlays
     """
-    raw = np.frombuffer(file.read(), np.uint8)
-    img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+    # Read with PIL first for robustness
+    pil_in = Image.open(file).convert("RGB")
+    np_in = np.array(pil_in)[:, :, ::-1]  # RGB->BGR for OpenCV-like ops
 
-    # 1) detect page and warp to top-down
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if cnts:
-        page = max(cnts, key=cv2.contourArea)
-        peri = cv2.arcLength(page, True)
-        approx = cv2.approxPolyDP(page, 0.02*peri, True)
-        if len(approx) == 4:
-            pts = approx.reshape(4,2).astype(np.float32)
-            s = pts.sum(axis=1); diff = np.diff(pts, axis=1).ravel()
-            ordered = np.array([pts[np.argmin(s)], pts[np.argmin(diff)], pts[np.argmax(s)], pts[np.argmax(diff)]], dtype=np.float32)
-            tl, tr, br, bl = ordered
-            widthA = np.linalg.norm(br - bl); widthB = np.linalg.norm(tr - tl)
-            heightA = np.linalg.norm(tr - br); heightB = np.linalg.norm(tl - bl)
-            maxW = int(max(widthA, widthB)); maxH = int(max(heightA, heightB))
-            M = cv2.getPerspectiveTransform(ordered, np.array([[0,0],[maxW-1,0],[maxW-1,maxH-1],[0,maxH-1]], dtype=np.float32))
-            img = cv2.warpPerspective(img, M, (maxW, maxH))
+    if CV_OK:
+        img = np_in.copy()
+        # 1) (optional) attempt perspective warp to top-down
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            blur = cv2.GaussianBlur(gray, (5,5), 0)
+            edges = cv2.Canny(blur, 50, 150)
+            cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                page = max(cnts, key=cv2.contourArea)
+                peri = cv2.arcLength(page, True)
+                approx = cv2.approxPolyDP(page, 0.02*peri, True)
+                if len(approx) == 4:
+                    pts = approx.reshape(4,2).astype(np.float32)
+                    s = pts.sum(axis=1); diff = np.diff(pts, axis=1).ravel()
+                    ordered = np.array([pts[np.argmin(s)], pts[np.argmin(diff)], pts[np.argmax(s)], pts[np.argmax(diff)]], dtype=np.float32)
+                    tl, tr, br, bl = ordered
+                    widthA = np.linalg.norm(br - bl); widthB = np.linalg.norm(tr - tl)
+                    heightA = np.linalg.norm(tr - br); heightB = np.linalg.norm(tl - bl)
+                    maxW = int(max(widthA, widthB)); maxH = int(max(heightA, heightB))
+                    M = cv2.getPerspectiveTransform(ordered, np.array([[0,0],[maxW-1,0],[maxW-1,maxH-1],[0,maxH-1]], dtype=np.float32))
+                    img = cv2.warpPerspective(img, M, (maxW, maxH))
+        except Exception:
+            pass
 
-    color = img.copy()
+        color = img.copy()
 
-    # 2) enhance + binarize
-    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    g = clahe.apply(g)
-    th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 31, 11)
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8))
+        # Enhance grayscale; binarize for CV
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        g_enh = clahe.apply(g)
+        th = cv2.adaptiveThreshold(g_enh, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 31, 11)
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8))
 
-    # 3) encode JPEG
-    pil = Image.fromarray(th)
-    buf = io.BytesIO()
-    pil.save(buf, format="JPEG", quality=95)
-    return buf.getvalue(), th, color
+        # Resize color for API (max side 1600) and save JPEG quality 80
+        h, w = color.shape[:2]
+        max_side = 1600
+        scale = min(1.0, max_side / max(h, w))
+        if scale < 1.0:
+            color_small = cv2.resize(color, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+        else:
+            color_small = color
+
+        pil_small = Image.fromarray(cv2.cvtColor(color_small, cv2.COLOR_BGR2RGB))
+        buf = io.BytesIO()
+        pil_small.save(buf, format="JPEG", quality=80)
+        api_bytes = buf.getvalue()
+
+        return api_bytes, th, color
+
+    else:
+        # Fallback: no OpenCV – use PIL only
+        img = pil_in
+        # Resize for API
+        max_side = 1600
+        w, h = img.size
+        scale = min(1.0, max_side / max(w, h))
+        if scale < 1.0:
+            img_small = img.resize((int(w*scale), int(h*scale)))
+        else:
+            img_small = img
+        buf = io.BytesIO()
+        img_small.save(buf, format="JPEG", quality=80)
+        api_bytes = buf.getvalue()
+
+        # Naive binarization for "CV-like" steps/overlays
+        gray = np.array(img.convert("L"))
+        th = (gray > 200).astype("uint8") * 255
+        color = np.array(img)[:, :, ::-1]  # RGB->BGR-ish
+        return api_bytes, th, color
 
 # ====================== CV MARK DETECTION ======================
 def pick_op_by_ink(block_bin: np.ndarray, op_boxes: List[Tuple[str,float,float,float,float]], thresh: float) -> str:
@@ -250,6 +313,10 @@ def pick_op_by_ink(block_bin: np.ndarray, op_boxes: List[Tuple[str,float,float,f
     return best_label if best_ink >= thresh else ""
 
 def compute_cv_ops(bin_img: np.ndarray, overlay_img: np.ndarray, thresh: float, show_overlay: bool):
+    if not CV_OK:
+        # No CV: return nothing detected and original overlay image
+        return {}, overlay_img
+
     H, W = bin_img.shape[:2]
     cv_ops = {}
     vis = overlay_img.copy()
@@ -261,16 +328,17 @@ def compute_cv_ops(bin_img: np.ndarray, overlay_img: np.ndarray, thresh: float, 
         end = pick_op_by_ink(block, ENDLINE_OP_BOXES, thresh)
         cv_ops[idx] = {"baselineOp": base or "", "endlineOp": end or ""}
 
-        if show_overlay:
+        if show_overlay and CV_OK:
             # draw student strip
-            cv2.rectangle(vis, (0, y0), (W-1, y1), (0, 255, 0), 2)
-            # draw op boxes
-            for (label, x0, y0f, x1, y1f) in BASELINE_OP_BOXES + ENDLINE_OP_BOXES:
-                bx0, by0 = int(x0*W), int((y0f*(y1-y0) + y0))
-                bx1, by1 = int(x1*W), int((y1f*(y1-y0) + y0))
-                cv2.rectangle(vis, (bx0, by0), (bx1, by1), (255, 0, 0), 1)
-                if label == base or label == end:
-                    cv2.rectangle(vis, (bx0, by0), (bx1, by1), (0, 0, 255), 2)
+            if CV_OK:
+                cv2.rectangle(vis, (0, y0), (W-1, y1), (0, 255, 0), 2)
+                # draw op boxes
+                for (label, x0, y0f, x1, y1f) in BASELINE_OP_BOXES + ENDLINE_OP_BOXES:
+                    bx0, by0 = int(x0*W), int((y0f*(y1-y0) + y0))
+                    bx1, by1 = int(x1*W), int((y1f*(y1-y0) + y0))
+                    cv2.rectangle(vis, (bx0, by0), (bx1, by1), (255, 0, 0), 1)
+                    if label == base or label == end:
+                        cv2.rectangle(vis, (bx0, by0), (bx1, by1), (0, 0, 255), 2)
 
     return cv_ops, vis
 
@@ -301,9 +369,7 @@ def footer_to_df(obj: Dict[str, Any], file_name: str) -> pd.DataFrame:
         })
     return pd.DataFrame(recs)
 
-# ---- Canonicalization helpers (place above flatten_rows) ----
-import re
-
+# ---- Canonicalization helpers (for model outputs + human edits) ----
 CANONICAL_OPS = {"Addition", "Subtraction", "Multiplication", "Division"}
 
 _OP_MAP = {
@@ -325,7 +391,7 @@ _OP_MAP = {
     # symbols
     "+":"Addition","-":"Subtraction","×":"Multiplication","x":"Multiplication","*":"Multiplication","÷":"Division","/":"Division",
 
-    # common short-hands
+    # short-hands
     "addn":"Addition","subs":"Subtraction"
 }
 
@@ -344,9 +410,16 @@ def coerce_op(val: str) -> str:
     return vt if vt in CANONICAL_OPS else ""
 
 def norm_op(v: str) -> str:
-    # Use the same canonicalization for human edits
+    """Use the same canonicalization for human edits."""
     return coerce_op(v)
 
+def norm_yn(v: str) -> str:
+    v = (v or "").strip().lower()
+    if v in ("yes","y","true","1"): return "Yes"
+    if v in ("no","n","false","0"): return "No"
+    return ""
+
+# ====================== ROW SHAPING ======================
 def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     teacher = obj.get("teacherName","") or ""
@@ -381,9 +454,12 @@ def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
         for idx, sess in enumerate(sessions, start=1):
             if not any((sess.get("datetime"), sess.get("currentTopic"),
                         sess.get("checkpointCorrect"), sess.get("parentAttended"), sess.get("nextTopic"))):
+                # if the whole row is empty, skip
                 continue
+
             ct_raw = sess.get("currentTopic","") or ""
             nt_raw = sess.get("nextTopic","") or ""
+
             row = {**base,
                    "session": f"Lesson {idx}",
                    "datetime": sess.get("datetime","") or "",
@@ -395,6 +471,7 @@ def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
             wrote_any = True
 
         if not wrote_any:
+            # create a minimal row so the student isn't lost
             rows.append({**base, "session":"", "datetime":"", "currentTopic":"",
                          "checkpointCorrect":"", "parentAttended":"", "nextTopic":""})
 
@@ -403,7 +480,8 @@ def flatten_rows(obj: Dict[str, Any], file_name: str) -> List[Dict[str, Any]]:
             r.setdefault(col,"")
     return rows
 
-# Sheets helpers
+# ====================== SHEETS HELPERS ======================
+@st.cache_resource
 def get_sheets_client():
     if not HAS_SHEETS:
         raise RuntimeError("gspread not installed.")
@@ -469,19 +547,21 @@ if uploaded:
     for i, f in enumerate(uploaded, start=1):
         status.info(f"Processing {f.name} ({i}/{len(uploaded)}) ...")
         try:
-            # Preprocess
-            jpeg_bytes, bin_img, overlay_img = preprocess_for_ocr(f)
+            # Preprocess (fast API bytes + binarized for CV)
+            api_jpeg_bytes, bin_img, overlay_img = preprocess_for_ocr(f)
 
             # Deterministic circled/ticked detection (before model)
             cv_ops, vis = compute_cv_ops(bin_img, overlay_img, thresh=mark_thresh, show_overlay=show_overlay)
-            if show_overlay:
-                debug_images.append((f.name, vis[:, :, ::-1]))  # BGR->RGB
+            if show_overlay and isinstance(vis, np.ndarray):
+                # convert BGR->RGB for display if CV_OK, else assume already RGB-ish
+                img_disp = vis[:, :, ::-1] if CV_OK else vis
+                debug_images.append((f.name, img_disp))
 
-            # Call model for main JSON
-            raw = call_json_vision(client, model=model, prompt=EXTRACTION_PROMPT, jpeg_bytes=jpeg_bytes)
+            # Main JSON via model
+            raw = call_json_vision(client, model=model, prompt=EXTRACTION_PROMPT, jpeg_bytes=api_jpeg_bytes)
             obj = safe_json_loads(raw)
 
-            # Override ops with CV results (never guess)
+            # Override ops with CV results (never guess circled ops)
             for idx, stu in enumerate(obj.get("students", []), start=1):
                 if idx in cv_ops:
                     for which in ["baselineOp","endlineOp"]:
@@ -497,15 +577,16 @@ if uploaded:
                         else:
                             stu["endlineMarks"] = marks
 
-            # Optional extra digit pass (crops)
+            # Optional extra digit pass (header + per-student)
             if extra_digit_pass:
                 H, W = bin_img.shape[:2]
                 # Header UDISE
                 x0, y0, x1, y1 = HEADER_UDISE_BOX
-                crop = bin_img[int(y0*H):int(y1*H), int(x0*W):int(x1*W)]
+                cx0, cy0, cx1, cy1 = int(x0*W), int(y0*H), int(x1*W), int(y1*H)
+                crop = bin_img[cy0:cy1, cx0:cx1]
                 if crop.size > 0:
                     buff = io.BytesIO()
-                    Image.fromarray(crop).save(buff, format="JPEG", quality=95)
+                    Image.fromarray(crop).save(buff, format="JPEG", quality=85)
                     try:
                         digits = call_digits_only(client, model, buff.getvalue())
                         if digits:
@@ -526,7 +607,7 @@ if uploaded:
                             crop = bin_img[cy0:cy1, cx0:cx1]
                             if crop.size > 0:
                                 buff = io.BytesIO()
-                                Image.fromarray(crop).save(buff, format="JPEG", quality=95)
+                                Image.fromarray(crop).save(buff, format="JPEG", quality=85)
                                 try:
                                     digits = call_digits_only(client, model, buff.getvalue())
                                     if digits:
@@ -556,16 +637,11 @@ if uploaded:
         st.success(f"Digitized {len(df_rows)} row(s) from {len(uploaded)-len(failures)} file(s).")
 
         # ===== Human-in-the-loop editor =====
-        st.subheader("Review & edit (only these columns are editable)")
+        st.subheader("Review & edit (editable: currentTopic, nextTopic, checkpointCorrect)")
         editable_cols = ["currentTopic","nextTopic","checkpointCorrect"]
 
-        # Restrict select options
-        op_col = st.column_config.SelectboxColumn(
-            "Operation", options=EDIT_OPS, help="Choose the operation or leave blank"
-        )
-        yn_col = st.column_config.SelectboxColumn(
-            "Checkpoint Correct", options=EDIT_YN, help="Choose Yes/No or leave blank"
-        )
+        op_col = st.column_config.SelectboxColumn("Operation", options=EDIT_OPS, help="Choose the operation or leave blank")
+        yn_col = st.column_config.SelectboxColumn("Checkpoint Correct", options=EDIT_YN, help="Yes/No or blank")
 
         edited_df = st.data_editor(
             df_rows,
@@ -580,25 +656,17 @@ if uploaded:
             key="editor",
         )
 
-        # Normalize edited values (case/aliases)
-        def norm_op(v: str) -> str:
-        # Reuse the same logic used for model outputs
-        return coerce_op(v)
-        def norm_yn(v: str) -> str:
-            v = (v or "").strip().lower()
-            if v in ("yes","y","true","1"): return "Yes"
-            if v in ("no","n","false","0"): return "No"
-            return ""
-
+        # Coerce human edits to canonical values
         edited_df["currentTopic"] = edited_df["currentTopic"].apply(norm_op)
-        edited_df["nextTopic"]     = edited_df["nextTopic"].apply(norm_op)
+        edited_df["nextTopic"] = edited_df["nextTopic"].apply(norm_op)
         edited_df["checkpointCorrect"] = edited_df["checkpointCorrect"].apply(norm_yn)
 
+        # Downloads
         st.download_button("Download CSV (edited rows)",
                            edited_df.to_csv(index=False).encode("utf-8"),
                            "kannada_rows_edited.csv","text/csv")
 
-        # Sheets push button (explicit)
+        # Push edited rows
         col_a, col_b = st.columns(2)
         with col_a:
             push_btn = st.button("Push EDITED rows to Google Sheet", type="primary")
@@ -613,7 +681,7 @@ if uploaded:
             except Exception as e:
                 st.error(f"Google Sheets append failed: {e}")
 
-        # Footer (unchanged, optional)
+        # Footer (optional)
         if all_footer:
             df_footer = pd.concat(all_footer, ignore_index=True)
             with st.expander("Bottom summary (lesson-wise)"):
